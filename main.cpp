@@ -6406,7 +6406,7 @@ static int32_t HandleEnumRegions(AsioProvider& kernel, PipeSession& s,
     if (s.eprocess == 0) return ASIO_ERR_NOT_ATTACHED;
 
     std::vector<AsioR0RegionEntry> regions;
-    uint64_t va = 0;
+    uint64_t va = 0x10000;  // skip null guard area (first 64KB is always reserved)
     uint64_t maxAddr = 0x00007FFFFFFFFFFFULL;
 
     while (va < maxAddr) {
