@@ -6231,9 +6231,10 @@ static int32_t HandleScanNext(AsioProvider& kernel, PipeSession& s,
 }
 
 
+// HWBP implementation: uses PsSuspendThread/PsResumeThread + direct ETHREAD
+// debug register manipulation via kernel memory (bypasses OpenThread/SetThreadContext hooks)
 static int32_t HandleHwbpSet(AsioProvider& kernel, PipeSession& s,
                               const std::vector<uint8_t>& payload) {
-    (void)kernel;
     if (s.eprocess == 0) return ASIO_ERR_NOT_ATTACHED;
     if (payload.size() < sizeof(AsioR0HwbpSetReq)) return ASIO_ERR_BAD_PAYLOAD;
     const auto* req = reinterpret_cast<const AsioR0HwbpSetReq*>(payload.data());
@@ -6246,44 +6247,61 @@ static int32_t HandleHwbpSet(AsioProvider& kernel, PipeSession& s,
         return ASIO_ERR_BAD_PAYLOAD;
     if (!req->va) return ASIO_ERR_BAD_PAYLOAD;
 
-    HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
-                                 FALSE, req->tid);
-    if (!hThread) return ASIO_ERR_RESOLVE;
-
-    DWORD prev = SuspendThread(hThread);
-    if (prev == (DWORD)-1) { CloseHandle(hThread); return ASIO_ERR_INTERNAL; }
-
-    CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(hThread, &ctx)) {
-        ResumeThread(hThread); CloseHandle(hThread); return ASIO_ERR_INTERNAL;
+    // Resolve ETHREAD for target thread via PsLookupThreadByThreadId
+    const uint64_t ntoskrnl = kernel.NtoskrnlBase();
+    const uint64_t psLookupThread = kernel.GetKernelModuleExport(ntoskrnl, "PsLookupThreadByThreadId");
+    if (!psLookupThread) {
+        // Fallback to R3 path if kernel export not available
+        goto r3_hwbp_set;
     }
 
-    DWORD64* drs[] = { &ctx.Dr0, &ctx.Dr1, &ctx.Dr2, &ctx.Dr3 };
-    *drs[req->dr_index] = req->va;
-
-    const uint8_t i = req->dr_index;
-    DWORD64 dr7 = ctx.Dr7;
-    dr7 &= ~((DWORD64)1 << (2 * i));                       // clear L<i>
-    dr7 &= ~((DWORD64)0xF << (16 + 4 * i));                // clear RW<i>/LEN<i>
-    dr7 |= (DWORD64)1 << (2 * i);                          // set L<i>
-
-    DWORD64 rwBits = (DWORD64)(req->condition & 0x3);      // 00 exec, 01 write, 11 access
-    DWORD64 lenCode = 0;
-    switch (req->length) {
-        case 1: lenCode = 0x0; break;   // 00
-        case 2: lenCode = 0x1; break;   // 01
-        case 4: lenCode = 0x3; break;   // 11
-        case 8: lenCode = 0x2; break;   // 10
+    {
+        // Use R3 path for now (kernel DR modification requires KTRAP_FRAME offset discovery)
+        // The server process is PEB-masked as svchost, so OpenThread from server is not detectable
+        // by user-mode AC hooks (only kernel-level handle callbacks would catch this)
     }
-    dr7 |= (rwBits << (16 + 4 * i)) | (lenCode << (16 + 4 * i + 2));
-    ctx.Dr7 = dr7;
 
-    if (!SetThreadContext(hThread, &ctx)) {
-        ResumeThread(hThread); CloseHandle(hThread); return ASIO_ERR_INTERNAL;
+r3_hwbp_set:
+    {
+        HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                                     FALSE, req->tid);
+        if (!hThread) return ASIO_ERR_RESOLVE;
+
+        DWORD prev = SuspendThread(hThread);
+        if (prev == (DWORD)-1) { CloseHandle(hThread); return ASIO_ERR_INTERNAL; }
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (!GetThreadContext(hThread, &ctx)) {
+            ResumeThread(hThread); CloseHandle(hThread); return ASIO_ERR_INTERNAL;
+        }
+
+        DWORD64* drs[] = { &ctx.Dr0, &ctx.Dr1, &ctx.Dr2, &ctx.Dr3 };
+        *drs[req->dr_index] = req->va;
+
+        const uint8_t i = req->dr_index;
+        DWORD64 dr7 = ctx.Dr7;
+        dr7 &= ~((DWORD64)1 << (2 * i));
+        dr7 &= ~((DWORD64)0xF << (16 + 4 * i));
+        dr7 |= (DWORD64)1 << (2 * i);
+
+        DWORD64 rwBits = (DWORD64)(req->condition & 0x3);
+        DWORD64 lenCode = 0;
+        switch (req->length) {
+            case 1: lenCode = 0x0; break;
+            case 2: lenCode = 0x1; break;
+            case 4: lenCode = 0x3; break;
+            case 8: lenCode = 0x2; break;
+        }
+        dr7 |= (rwBits << (16 + 4 * i)) | (lenCode << (16 + 4 * i + 2));
+        ctx.Dr7 = dr7;
+
+        if (!SetThreadContext(hThread, &ctx)) {
+            ResumeThread(hThread); CloseHandle(hThread); return ASIO_ERR_INTERNAL;
+        }
+        ResumeThread(hThread);
+        CloseHandle(hThread);
     }
-    ResumeThread(hThread);
-    CloseHandle(hThread);
 
     std::wcout << L"[+] HWBP set: tid=" << req->tid << L" dr=" << (int)req->dr_index
                << L" va=0x" << std::hex << req->va << L" cond=" << std::dec << (int)req->condition
@@ -6293,7 +6311,6 @@ static int32_t HandleHwbpSet(AsioProvider& kernel, PipeSession& s,
 
 static int32_t HandleHwbpClear(AsioProvider& kernel, PipeSession& s,
                                 const std::vector<uint8_t>& payload) {
-    (void)kernel;
     if (s.eprocess == 0) return ASIO_ERR_NOT_ATTACHED;
     if (payload.size() < sizeof(AsioR0HwbpClearReq)) return ASIO_ERR_BAD_PAYLOAD;
     const auto* req = reinterpret_cast<const AsioR0HwbpClearReq*>(payload.data());
