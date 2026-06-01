@@ -4898,10 +4898,19 @@ static bool ReadTargetMemViaMdl(AsioProvider& kernel, uint64_t eprocess, uint64_
     if (!eprocess || !va || !outBuffer || !size) return false;
     if (size > (1ull << 20)) return false;  // 1 MiB cap per call (caller chunks)
 
-    if (cr3 && !IsVaLockableForMdl(kernel, cr3, va, size)) {
-        // PTE pre-check decided this VA is unsafe to lock. Bail without
-        // hitting the kernel — avoids the bugcheck path.
-        return false;
+    // Double PTE pre-check: read PTE twice with a small gap to reduce the
+    // TOCTOU window between our check and MmProbeAndLockPages. If the page
+    // transitions between checks, bail — the target is actively paging and
+    // we'd race the kernel pager.
+    if (cr3) {
+        if (!IsVaLockableForMdl(kernel, cr3, va, size))
+            return false;
+        // Second check — catches pages being paged out between reads
+        if (!IsVaLockableForMdl(kernel, cr3, va, size)) {
+            std::wcout << L"[!] MDL read: PTE changed between double-check at va=0x"
+                       << std::hex << va << std::dec << std::endl;
+            return false;
+        }
     }
 
     static uint64_t s_shellPool = 0;
@@ -5118,8 +5127,15 @@ static bool WriteTargetMemViaMdl(AsioProvider& kernel, uint64_t eprocess, uint64
     if (!eprocess || !va || !inBuffer || !size) return false;
     if (size > (1ull << 20)) return false;
 
-    if (cr3 && !IsVaLockableForMdl(kernel, cr3, va, size)) {
-        return false;
+    // Double PTE pre-check (same TOCTOU reduction as read path)
+    if (cr3) {
+        if (!IsVaLockableForMdl(kernel, cr3, va, size))
+            return false;
+        if (!IsVaLockableForMdl(kernel, cr3, va, size)) {
+            std::wcout << L"[!] MDL write: PTE changed between double-check at va=0x"
+                       << std::hex << va << std::dec << std::endl;
+            return false;
+        }
     }
 
     static uint64_t s_shellPool = 0;
@@ -6401,52 +6417,141 @@ static int32_t HandleQueryRegion(AsioProvider& kernel, PipeSession& s,
 }
 
 // Bulk region snapshot: walk user-mode address space and return all regions.
+// Multi-level page table walker for fast region enumeration.
+// Skips 512GB/1GB/2MB gaps at PML4/PDPT/PD levels instead of
+// walking every 4KB page across the 128TB user address space.
+static void WalkPageTableForRegions(AsioProvider& kernel, uint64_t cr3,
+                                    uint64_t rangeStart, uint64_t rangeEnd,
+                                    std::vector<AsioR0RegionEntry>& regions) {
+    constexpr uint64_t kPml4Span = 1ull << 39;   // 512 GB per PML4 entry
+    constexpr uint64_t kPdptSpan = 1ull << 30;   // 1 GB per PDPT entry
+    constexpr uint64_t kPdSpan   = 1ull << 21;   // 2 MB per PD entry
+    constexpr uint64_t kPtSpan   = 1ull << 12;   // 4 KB per PT entry
+
+    const uint64_t pml4Base = cr3 & kPhyAddressMask;
+
+    // Active region tracking — coalesce adjacent pages with same protection
+    uint64_t regionVa = 0, regionEnd = 0;
+    uint32_t regionProtect = 0;
+
+    auto FlushRegion = [&]() {
+        if (regionVa == 0 || regionEnd <= regionVa) return;
+        AsioR0RegionEntry e{};
+        e.base = regionVa;
+        e.region_size = regionEnd - regionVa;
+        e.allocation_base = regionVa;
+        e.state = 0x1000;   // MEM_COMMIT
+        e.protect = regionProtect;
+        e.allocation_protect = regionProtect;
+        e._type = 0x20000;  // MEM_PRIVATE
+        regions.push_back(e);
+        regionVa = regionEnd = 0;
+    };
+
+    for (uint64_t pml4i = (rangeStart >> 39) & 0x1ff;
+         pml4i < 512 && (pml4i << 39) < rangeEnd; ++pml4i) {
+
+        uint64_t pml4e = 0;
+        if (!kernel.ReadPhysical(pml4Base + pml4i * 8, &pml4e, 8) ||
+            !(pml4e & kEntryPresent)) {
+            FlushRegion();
+            continue; // skip 512 GB
+        }
+        const uint64_t pdptBase = pml4e & kPhyAddressMask;
+
+        for (uint64_t pdpti = 0; pdpti < 512; ++pdpti) {
+            const uint64_t vaBlock = (pml4i << 39) | (pdpti << 30);
+            if (vaBlock >= rangeEnd) { FlushRegion(); return; }
+            if (vaBlock + kPdptSpan <= rangeStart) continue;
+
+            uint64_t pdpte = 0;
+            if (!kernel.ReadPhysical(pdptBase + pdpti * 8, &pdpte, 8) ||
+                !(pdpte & kEntryPresent)) {
+                FlushRegion();
+                continue; // skip 1 GB
+            }
+
+            // 1 GB large page
+            if (pdpte & kEntryPageSize) {
+                uint32_t st, pr, tp;
+                PteToRegionInfo(pdpte, true, st, pr, tp);
+                if (regionVa && regionEnd == vaBlock && regionProtect == pr) {
+                    regionEnd = vaBlock + kPdptSpan;
+                } else {
+                    FlushRegion();
+                    regionVa = vaBlock;
+                    regionEnd = vaBlock + kPdptSpan;
+                    regionProtect = pr;
+                }
+                continue;
+            }
+
+            const uint64_t pdBase = pdpte & kPhyAddressMask;
+
+            for (uint64_t pdi = 0; pdi < 512; ++pdi) {
+                const uint64_t vaBlock2 = vaBlock | (pdi << 21);
+                if (vaBlock2 >= rangeEnd) { FlushRegion(); return; }
+                if (vaBlock2 + kPdSpan <= rangeStart) continue;
+
+                uint64_t pde = 0;
+                if (!kernel.ReadPhysical(pdBase + pdi * 8, &pde, 8) ||
+                    !(pde & kEntryPresent)) {
+                    FlushRegion();
+                    continue; // skip 2 MB
+                }
+
+                // 2 MB large page
+                if (pde & kEntryPageSize) {
+                    uint32_t st, pr, tp;
+                    PteToRegionInfo(pde, true, st, pr, tp);
+                    if (regionVa && regionEnd == vaBlock2 && regionProtect == pr) {
+                        regionEnd = vaBlock2 + kPdSpan;
+                    } else {
+                        FlushRegion();
+                        regionVa = vaBlock2;
+                        regionEnd = vaBlock2 + kPdSpan;
+                        regionProtect = pr;
+                    }
+                    continue;
+                }
+
+                const uint64_t ptBase = pde & kPhyAddressMask;
+
+                for (uint64_t pti = 0; pti < 512; ++pti) {
+                    const uint64_t pageVa = vaBlock2 | (pti << 12);
+                    if (pageVa >= rangeEnd) { FlushRegion(); return; }
+                    if (pageVa + kPtSpan <= rangeStart) continue;
+
+                    uint64_t pte = 0;
+                    if (!kernel.ReadPhysical(ptBase + pti * 8, &pte, 8) ||
+                        !(pte & kPtePresent)) {
+                        FlushRegion();
+                        continue;
+                    }
+
+                    uint32_t st, pr, tp;
+                    PteToRegionInfo(pte, true, st, pr, tp);
+                    if (regionVa && regionEnd == pageVa && regionProtect == pr) {
+                        regionEnd = pageVa + kPtSpan;
+                    } else {
+                        FlushRegion();
+                        regionVa = pageVa;
+                        regionEnd = pageVa + kPtSpan;
+                        regionProtect = pr;
+                    }
+                }
+            }
+        }
+    }
+    FlushRegion();
+}
+
 static int32_t HandleEnumRegions(AsioProvider& kernel, PipeSession& s,
                                  std::vector<uint8_t>& out) {
     if (s.eprocess == 0) return ASIO_ERR_NOT_ATTACHED;
 
     std::vector<AsioR0RegionEntry> regions;
-    uint64_t va = 0x10000;  // skip null guard area (first 64KB is always reserved)
-    uint64_t maxAddr = 0x00007FFFFFFFFFFFULL;
-
-    while (va < maxAddr) {
-        uint64_t pte = 0;
-        if (!ReadTargetPteRaw(kernel, s.cr3, va, pte)) {
-            va += 0x1000;
-            continue;
-        }
-
-        bool isPresent = (pte & kPtePresent) != 0;
-
-        // Scan forward to find region end
-        uint64_t regionEnd = va + 0x1000;
-        while (regionEnd < maxAddr) {
-            uint64_t nextPte = 0;
-            if (!ReadTargetPteRaw(kernel, s.cr3, regionEnd, nextPte)) break;
-            bool nextPresent = (nextPte & kPtePresent) != 0;
-            if (nextPresent != isPresent) break;
-            if (isPresent) {
-                uint32_t s1, p1, t1, s2, p2, t2;
-                PteToRegionInfo(pte, isPresent, s1, p1, t1);
-                PteToRegionInfo(nextPte, nextPresent, s2, p2, t2);
-                if (p1 != p2) break;
-            }
-            regionEnd += 0x1000;
-        }
-
-        // Only emit committed regions (skip free)
-        if (isPresent) {
-            AsioR0RegionEntry entry{};
-            entry.base = va;
-            entry.region_size = regionEnd - va;
-            entry.allocation_base = va;
-            PteToRegionInfo(pte, isPresent, entry.state, entry.protect, entry._type);
-            entry.allocation_protect = entry.protect;
-            regions.push_back(entry);
-        }
-
-        va = regionEnd;
-    }
+    WalkPageTableForRegions(kernel, s.cr3, 0x10000, 0x00007FFFFFFFFFFFULL, regions);
 
     // Serialize: AsioR0RegionListResp + N * AsioR0RegionEntry
     AsioR0RegionListResp header{};
