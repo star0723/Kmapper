@@ -39,6 +39,8 @@ constexpr uint32_t ASIO_OP_HWBP_CLEAR   = 0x0D;
 constexpr uint32_t ASIO_OP_QUERY_REGION = 0x0E;
 constexpr uint32_t ASIO_OP_ENUM_REGIONS = 0x0F;
 constexpr uint32_t ASIO_OP_ENUM_PROCS   = 0x10;
+constexpr uint32_t ASIO_OP_ENUM_THREADS = 0x11;
+constexpr uint32_t ASIO_OP_FREE_MEM     = 0x12;
 constexpr uint32_t ASIO_OP_SHUTDOWN     = 0xFF;
 
 // --- Status codes -----------------------------------------------------------
@@ -261,6 +263,28 @@ struct AsioR0ProcEntry {
     uint32_t pid;
     uint32_t reserved;
     char     name[16];
+};
+
+// --- ENUM_THREADS -----------------------------------------------------------
+
+struct AsioR0ThreadListResp {
+    uint32_t count;
+    uint32_t reserved;
+    // followed by count * AsioR0ThreadEntry
+};
+
+struct AsioR0ThreadEntry {
+    uint32_t tid;
+    uint32_t reserved;
+    uint64_t start_address;
+    uint64_t teb;
+};
+
+// --- FREE_MEM ---------------------------------------------------------------
+
+struct AsioR0FreeReq {
+    uint64_t va;
+    uint64_t size;
 };
 
 #pragma pack(pop)
