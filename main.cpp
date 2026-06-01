@@ -6887,7 +6887,8 @@ static int RunR0Server(AsioProvider& kernel, const std::wstring& pipeNameIn) {
         swprintf_s(infoPath, L"%sasio_pipe_name.txt", tempDir);
         FILE* fp = nullptr;
         if (_wfopen_s(&fp, infoPath, L"w") == 0 && fp) {
-            std::fwprintf(fp, L"%s\n", pipeName.c_str());
+            // Write as narrow ANSI so CE's TStringList.LoadFromFile can parse it
+            std::fprintf(fp, "%ls\n", pipeName.c_str());
             std::fclose(fp);
         }
     }
