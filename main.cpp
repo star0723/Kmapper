@@ -6712,7 +6712,7 @@ static int32_t HandleEnumProcesses(AsioProvider& kernel,
 
 static int32_t HandleEnumThreads(AsioProvider& kernel, PipeSession& session,
                                  std::vector<uint8_t>& outBytes) {
-    if (!session.targetCr3) return ASIO_ERR_NOT_ATTACHED;
+    if (!session.cr3) return ASIO_ERR_NOT_ATTACHED;
 
     const uint64_t ntoskrnl = kernel.NtoskrnlBase();
 
@@ -6737,7 +6737,7 @@ static int32_t HandleEnumThreads(AsioProvider& kernel, PipeSession& session,
         // Allocate kernel memory for the output pointer
         uint64_t outBuf = 0;
         // Use existing ResolveTargetEprocess
-        targetEprocess = ResolveTargetEprocess(kernel, session.targetPid);
+        targetEprocess = ResolveTargetEprocess(kernel, session.pid);
     }
     if (!targetEprocess) return ASIO_ERR_RESOLVE;
 
@@ -6826,7 +6826,7 @@ static int32_t HandleEnumThreads(AsioProvider& kernel, PipeSession& session,
             if (baseGuess < 0xFFFF800000000000ULL) break;
             uint32_t procId = 0, thrId = 0;
             if (!kernel.ReadKernelMemory(baseGuess + cidOff, &procId, 4)) continue;
-            if (procId != session.targetPid) continue;
+            if (procId != session.pid) continue;
             if (!kernel.ReadKernelMemory(baseGuess + cidOff + 8, &thrId, 4)) continue;
             if (thrId == 0 || thrId > 0x100000) continue;
             ti.tid = thrId;
@@ -6868,7 +6868,7 @@ static int32_t HandleEnumThreads(AsioProvider& kernel, PipeSession& session,
         appendBytes(&e, sizeof(e));
     }
 
-    std::wcout << L"[+] ENUM_THREADS: " << threads.size() << L" threads for pid " << session.targetPid << std::endl;
+    std::wcout << L"[+] ENUM_THREADS: " << threads.size() << L" threads for pid " << session.pid << std::endl;
     return ASIO_OK;
 }
 
@@ -6878,7 +6878,7 @@ static int32_t HandleEnumThreads(AsioProvider& kernel, PipeSession& session,
 
 static int32_t HandleFreeMem(AsioProvider& kernel, PipeSession& session,
                              const uint8_t* payload, uint64_t payloadLen) {
-    if (!session.targetCr3) return ASIO_ERR_NOT_ATTACHED;
+    if (!session.cr3) return ASIO_ERR_NOT_ATTACHED;
     if (payloadLen < sizeof(AsioR0FreeReq)) return ASIO_ERR_BAD_PAYLOAD;
 
     AsioR0FreeReq req{};
@@ -6896,7 +6896,7 @@ static int32_t HandleFreeMem(AsioProvider& kernel, PipeSession& session,
     // This requires attaching to target process context first
 
     // Use ObOpenObjectByPointer to get a handle to target process
-    uint64_t targetEprocess = ResolveTargetEprocess(kernel, session.targetPid);
+    uint64_t targetEprocess = ResolveTargetEprocess(kernel, session.pid);
     if (!targetEprocess) return ASIO_ERR_RESOLVE;
 
     const uint64_t obOpen = kernel.GetKernelModuleExport(ntoskrnl, "ObOpenObjectByPointer");
@@ -7166,7 +7166,9 @@ static int RunR0Server(AsioProvider& kernel, const std::wstring& pipeNameIn) {
         std::wstring hintPath = GenerateHintFileName();
         FILE* fp = nullptr;
         if (_wfopen_s(&fp, hintPath.c_str(), L"w") == 0 && fp) {
-            std::fprintf(fp, "%ls\n", pipeName.c_str());
+            // Write as narrow ANSI — CE client reads via TStringList (ANSI)
+            std::string narrow(pipeName.begin(), pipeName.end());
+            std::fprintf(fp, "%s\n", narrow.c_str());
             std::fclose(fp);
         }
     }
